@@ -4,10 +4,7 @@ import queue
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from collections import namedtuple
-
-HttpEvent = namedtuple("HttpEvent", "event_type timestamp command headers url client_ip body")
-
+from .data import HttpEvent
 
 def HttpEventCollectorFact(q):
     class HttpEventCollector(BaseHTTPRequestHandler):

@@ -3,28 +3,24 @@ import os
 import queue
 import sqlite3
 import subprocess
-import time
-import toml
 import threading
-
-import pdb
+import time
 
 import collections
 
-import httpd_server
-
-ProcessEvent = collections.namedtuple("EventRecord", "event_type start_ts end_ts command output return_code")
-Job = collections.namedtuple("Job", "time_delta_s command")
+from . import httpd_server
+from .data import Job, ProcessEvent, HttpEvent
 
 def init_db(database_path):
     if not os.path.isfile(database_path):
         conn = sqlite3.connect(database_path)
         create_schema(conn)
-        insert_jobs(conn)
+        init_jobs(conn)
         return conn
     else:
         conn = sqlite3.connect(database_path)
         return conn
+
 
 def create_schema(conn):
         conn.execute("""\
@@ -56,30 +52,46 @@ create table http_event (
 """)
         conn.commit()
 
-
-def insert_jobs(conn):
-    conn.execute("insert into job(time_delta_s, active, command) values (?,?,?)", (15,1,"/Users/basho/x.env/bin/riak-mesos node status"))
-    conn.execute("insert into job(time_delta_s, active, command) values (?,?,?)", (15,1,"/Users/basho/x.env/bin/riak-mesos node transfers --node riak-default-1"))
-    conn.commit()
+def init_jobs(conn):
+    insert_job(conn, Job(time_delta_s=60, command='date'))
 
 
-def insert_debug_jobs(conn):
-    conn.execute("insert into job(time_delta_s,active, command) values (?,?,?)", (30,1,"date"))
+def insert_job(conn, job):
+    conn.execute("insert into job(time_delta_s, active, command) values (?,?,?)",
+                 (job.time_delta_s, 1, job.command))
     conn.commit()
 
 
 def insert_proc_event(conn, event):
     e = event
     assert isinstance(e, ProcessEvent)
-    conn.execute("insert into process_event values (?,?,?,?,?)", (e.start_ts, e.end_ts, e.command, e.output, e.return_code))
+    conn.execute("insert into process_event values (?,?,?,?,?)",
+                 (e.start_ts, e.end_ts, e.command, e.output, e.return_code))
     conn.commit()
 
 
 def insert_http_event(conn, event):
     e = event
     assert isinstance(e, httpd_server.HttpEvent)
-    conn.execute("insert into http_event values (?,?,?,?,?,?)", (e.timestamp, e.command, e.headers, e.url, e.client_ip, e.body))
+    conn.execute("insert into http_event values (?,?,?,?,?,?)",
+                 (e.timestamp, e.command, e.headers, e.url, e.client_ip, e.body))
     conn.commit()
+
+
+def dktr_minperiod(seconds=1):
+    def dktr(wrapped_func):
+        last_call = [ 0, None ]
+        def fn(*args,**kwargs):
+            if time.time() - last_call[0] > seconds:
+                result = wrapped_func(*args,**kwargs)
+                last_call[0] = time.time()
+                last_call[1] = result
+                return result
+            else:
+                return last_call[1]
+        return fn
+    return dktr
+
 
 
 def run(job,at_timestamp,q):
@@ -101,6 +113,7 @@ def run(job,at_timestamp,q):
     t.start()
     return t
 
+
 def handle_event(c, event):
     if event.event_type == 'PROC':
         insert_proc_event(c, event)
@@ -112,70 +125,76 @@ def handle_event(c, event):
             insert_http_event(c, event)
 
 
+
 def http_main(c, port):
     print("starting http on {}".format(port))
     event_queue = httpd_server.mk_http_queue(port)
 
-    def job_queue(jobs):
+    def job_manager(update_q):
         now = time.time
 
         # stores last timestamp that a job was *scheduled* to run
         last_job_t = collections.defaultdict(lambda: 0)
 
+        jobs = []
         while 1:
+            try:
+                new_jobs = update_q.get(block=True,timeout=1)
+            except queue.Empty as e:
+                pass
+            else:
+                if new_jobs is not None:
+                    jobs = new_jobs
+
             job_threads = []
             for job in jobs:
                 try:
                     last_t = last_job_t[job.command]
-                    last_job_t[job.command] = now()
-                    job_threads.append(run(job, max(last_t + job.time_delta_s, last_job_t[job.command]), event_queue))
+                    future_t = max(last_t + job.time_delta_s, now())
+                    last_job_t[job.command] = future_t
+
+                    job_threads.append(run(job, future_t, event_queue))
                 except Exception as e:
                     print(e)
-                    print(job, "failed")
 
             print(job_threads)
             for t in job_threads:
                 t.join()
 
-    ## BROKEN, we can only access sqlite from the main thread
-    # pull fresh jobs for each invocation
-    # allows submitting new jobs during execution
-    # this won't pickup new jobs until the longest job has completed
 
-    def mk_job(*args):
-        return Job(int(args[0]),args[1])
+    job_update_q = queue.Queue()
 
+    job_daemon = threading.Thread(target=job_manager, args=(job_update_q,))
+    job_daemon.daemon
+    job_daemon.start()
 
-    jobs = [Job(*result) for result in c.execute("SELECT time_delta_s,command FROM job WHERE active = 1")]
-    job_manager = threading.Thread(target=job_queue, args=(jobs,))
-    job_manager.daemon
-    job_manager.start()
+    @dktr_minperiod(seconds=15)
+    def enqueue_new_jobs():
+        jobs = [Job(*result) for result in c.execute("SELECT time_delta_s,command FROM job WHERE active = 1")]
+        job_update_q.put(jobs)
 
 
     while 1:
         try:
+            enqueue_new_jobs()
             event = event_queue.get(block=True)
             print("EVNTQ",event)
 
             if event is not None:
                 handle_event(c, event)
                 event = None
+
         except Exception as e:
             print(e)
             time.sleep(1)
 
 
 
+def main(database, port):
+    """
+    python eventuretime.py --database perf-run.db 9005
 
-
-def test_http():
-    c = sqlite3.connect("test-http-server.db")
-    create_schema(c)
-    insert_debug_jobs(c)
-    http_main(c, 9003)
-
-
-if __name__ == "__main__":
-    # c = init_db("biggums-test.db")
-    # main(c)
-    test_http()
+    then in another
+    """
+    c = init_db(database)
+    http_main(c, port)
