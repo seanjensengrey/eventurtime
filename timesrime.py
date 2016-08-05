@@ -83,8 +83,6 @@ def insert_http_event(conn, event):
 
 
 def run(job,at_timestamp,q):
-    pdb.set_trace()
-
     now = time.time()
     delta_t = at_timestamp - now
 
@@ -103,12 +101,9 @@ def run(job,at_timestamp,q):
     t.start()
     return t
 
-def handle_event(c, last_job_t, event):
+def handle_event(c, event):
     if event.event_type == 'PROC':
         insert_proc_event(c, event)
-        # this conflates Job and ProcessEvent
-        # fix
-        last_job_t[event.command] = event.start_ts
 
     if event.event_type == 'HTTP':
         if event.url == '/favicon.ico':
@@ -121,49 +116,55 @@ def http_main(c, port):
     print("starting http on {}".format(port))
     event_queue = httpd_server.mk_http_queue(port)
 
-    # stores last timestamp that a job was *scheduled* to run
-    last_job_t = collections.defaultdict(lambda: 0)
+    def job_queue(jobs):
+        now = time.time
 
-    now = time.time
+        # stores last timestamp that a job was *scheduled* to run
+        last_job_t = collections.defaultdict(lambda: 0)
 
-    def drain_queue():
-        while not event_queue.empty():
-            try:
-                event = event_queue.get(block=True)
-                print("EVNTQ",event)
+        while 1:
+            job_threads = []
+            for job in jobs:
+                try:
+                    last_t = last_job_t[job.command]
+                    last_job_t[job.command] = now()
+                    job_threads.append(run(job, max(last_t + job.time_delta_s, last_job_t[job.command]), event_queue))
+                except Exception as e:
+                    print(e)
+                    print(job, "failed")
 
-            except queue.Empty as e:
-                continue
+            print(job_threads)
+            for t in job_threads:
+                t.join()
 
-            else:
-                if event is not None:
-                    handle_event(c, last_job_t, event)
-                    event = None
+    ## BROKEN, we can only access sqlite from the main thread
+    # pull fresh jobs for each invocation
+    # allows submitting new jobs during execution
+    # this won't pickup new jobs until the longest job has completed
 
-    drain = threading.Thread(target=drain_queue)
-    drain.daemon = True
-    drain.start()
+    def mk_job(*args):
+        return Job(int(args[0]),args[1])
+
+
+    jobs = [Job(*result) for result in c.execute("SELECT time_delta_s,command FROM job WHERE active = 1")]
+    job_manager = threading.Thread(target=job_queue, args=(jobs,))
+    job_manager.daemon
+    job_manager.start()
+
 
     while 1:
-        # pull fresh jobs for each invocation
-        # allows submitting new jobs during execution
-        # this won't pickup new jobs until the longest job has completed
+        try:
+            event = event_queue.get(block=True)
+            print("EVNTQ",event)
 
-        jobs = [Job(*result) for result in c.execute("SELECT time_delta_s,command FROM job WHERE active = 1")]
-        print(jobs)
-        job_threads = []
-        for job in jobs:
-            try:
-                last_t = last_job_t[job.command]
-                last_job_t[job.command] = now()
-                job_threads.append(run(job, max(last_t + job.time_delta_s, last_job_t[job.command]), event_queue))
-            except Exception as e:
-                print(e)
-                print(job, "failed")
+            if event is not None:
+                handle_event(c, event)
+                event = None
+        except Exception as e:
+            print(e)
+            time.sleep(1)
 
-        print(job_threads)
-        for t in job_threads:
-            t.join()
+
 
 
 
