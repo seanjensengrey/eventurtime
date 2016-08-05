@@ -104,9 +104,10 @@ def run(job,at_timestamp,q):
             time.sleep(delta_t)
 
         start_ts = arrow.utcnow()
-        proc = subprocess.run(job.command.split(' '), stdout=subprocess.PIPE)
+        proc = subprocess.Popen(job.command.split(' '), stdout=subprocess.PIPE)
+        stdout = proc.communicate()[0]
         end_ts = arrow.utcnow()
-        event = ProcessEvent('PROC', start_ts.timestamp, end_ts.timestamp, job.command, proc.stdout.strip(), proc.returncode)
+        event = ProcessEvent('PROC', start_ts.timestamp, end_ts.timestamp, job.command, stdout.strip(), proc.returncode)
         q.put(event)
 
     t = threading.Thread(target=job_thread)
